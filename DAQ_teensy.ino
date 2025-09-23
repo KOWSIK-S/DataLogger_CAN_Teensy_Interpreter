@@ -1,63 +1,105 @@
+Updated v1.1 
+
 #include <FlexCAN_T4.h>
-#include <SD.h>
-#include <SPI.h>
+#include <SdFat.h>
+#include <WDT_T4.h>
+#include <CRC32.h>
 
-// CAN on Teensy 4.1
+// -------------------- Hardware & System Setup --------------------
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
-File logfile;
+SdFat sd;
+SdFile logfile;
+WDT_T4<WDT1> wdt;
 
-// --- BUFFERING VARIABLES ---
+const int LED_PIN = 13; // Onboard LED for status
+const int CHIP_SELECT = BUILTIN_SDCARD;
+char filename[32];
+uint16_t fileIndex = 0;
+
+// -------------------- Performance & Reliability Settings --------------------
 String logBuffer = "";
-const int BUFFER_SIZE = 50;
+const int BUFFER_SIZE = 50;       // Number of lines to buffer in RAM before writing
+const uint32_t FILE_SIZE_LIMIT = 5L * 1024L * 1024L; // 5MB limit per log file
+const uint32_t TIMEOUT_MS = 250;  // CAN bus timeout in milliseconds
+uint32_t lastMessageTime = 0;
 int lineCount = 0;
 
-// --- ERROR HANDLING VARIABLES ---
-uint32_t lastMessageTime = 0; // Tracks the time of the last received message
-const uint32_t TIMEOUT_MS = 250; // Timeout period in milliseconds
+// -------------------- Global Decoded Data Variables --------------------
+// Initialized to -1 to indicate no data received yet
+int rpm = -1;
+float tps = -1.0;
+float ect = -1.0;
+float map_mbar = -1.0;
+float vbat = -1.0;
+int gear = -1;
+float lambda1 = -1.0;
 
-// Global variables for all decoded values
-int rpm = 0;
-float tps = 0.0;
-float ect = 0.0;
-float map_mbar = 0.0;
-float vbat = 0.0;
-int gear = 0;
-float lambda1 = 0.0;
+// -------------------- Function to create a new log file --------------------
+void newLogFile() {
+  do {
+    snprintf(filename, sizeof(filename), "LOG_%03d.CSV", fileIndex++);
+  } while (sd.exists(filename));
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) {}
-
-  Can0.begin();
-  Can0.setBaudRate(500000);
-
-  if (!SD.begin(BUILTIN_SDCARD)) {
-    Serial.println("SD init failed!"); while(1);
+  if (!logfile.open(filename, O_WRONLY | O_CREAT | O_APPEND)) {
+    Serial.println("FATAL: Log file creation failed!");
+    digitalWrite(LED_PIN, HIGH); // Solid LED indicates fatal error
+    while (1); // Halt execution
   }
 
-  logfile = SD.open("rugged_log.csv", FILE_WRITE);
-  if (!logfile) {
-    Serial.println("Log file creation failed!"); while(1);
-  }
-
-  logBuffer.reserve(4096); 
-  logfile.println("Time(ms),RPM,TPS(%),Coolant(C),MAP(mBar),VBAT(V),Gear,Lambda1");
+  // Write the header for the new file
+  logfile.println("Time(ms),RPM,TPS(%),Coolant(C),MAP(mBar),VBAT(V),Gear,Lambda1,CRC32");
   logfile.flush();
-
-  Serial.println("Ruggedized logging started...");
-  lastMessageTime = millis(); // Initialize the timer
+  Serial.print("Logging to new file: ");
+  Serial.println(filename);
 }
 
+// -------------------- Setup Function --------------------
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.begin(115200);
+  delay(2000); // Wait for serial to connect
+  Serial.println("--- MotoStudent Rugged CAN Logger ---");
+
+  // Initialize CAN bus
+  Can0.begin();
+  Can0.setBaudRate(500000); // Set to 500 kbit/s as per AIM spec
+
+  // Initialize SD card
+  if (!sd.begin(CHIP_SELECT, SD_SCK_MHZ(50))) { // Use a fast clock speed
+    Serial.println("FATAL: SD card initialization failed!");
+    digitalWrite(LED_PIN, HIGH);
+    while (1);
+  }
+
+  // Create the first log file
+  newLogFile();
+
+  // Initialize Watchdog Timer (4-second timeout)
+  WDT_timings_t config;
+  config.timeout = 4000;
+  wdt.begin(config);
+
+  // Pre-allocate memory for the string buffer for better performance
+  logBuffer.reserve(4096);
+
+  Serial.println("System initialized. Logging started.");
+  lastMessageTime = millis();
+}
+
+// -------------------- Main Loop --------------------
 void loop() {
+  wdt.feed(); // Feed the watchdog to prevent a reset
+
   CAN_message_t msg;
   bool messageReceived = false;
 
   if (Can0.read(msg)) {
     messageReceived = true;
-    lastMessageTime = millis(); // Reset timer on any valid message
+    lastMessageTime = millis(); // Reset the CAN timeout timer
 
-    // This switch statement inherently acts as our filter.
-    // It only processes the CAN IDs we care about and ignores all others.
+    // Filter and decode only the CAN IDs we care about
     switch (msg.id) {
       case 0x5F0:
         rpm = (msg.buf[0] | (msg.buf[1] << 8));
@@ -79,28 +121,39 @@ void loop() {
     }
   }
 
-  // --- ERROR HANDLING: Check for timeout ---
+  // Check for CAN communication timeout
   if (millis() - lastMessageTime > TIMEOUT_MS) {
-    // If no message is received for 250ms, assume connection is lost.
-    // Log invalid data (-1) to make the error visible in the data.
-    rpm = -1; tps = -1; ect = -1; map_mbar = -1; vbat = -1; gear = -1; lambda1 = -1;
-    messageReceived = true; // Force a log entry to show the error
+    rpm = -1; tps = -1.0; ect = -1.0; map_mbar = -1.0; vbat = -1.0; gear = -1; lambda1 = -1.0;
+    messageReceived = true; // Force a log entry to record the timeout
   }
-  
-  // --- BUFFERING LOGIC ---
+
+  // If we have new data (either real or a timeout), log it
   if (messageReceived) {
-    String dataLine = String(millis()) + "," + String(rpm) + "," + String(tps, 2) + "," + 
-                      String(ect, 1) + "," + String(map_mbar, 1) + "," + String(vbat, 2) + "," + 
+    // 1. Construct the data line string (without CRC)
+    String dataLine = String(millis()) + "," + String(rpm) + "," + String(tps, 2) + "," +
+                      String(ect, 1) + "," + String(map_mbar, 1) + "," + String(vbat, 2) + "," +
                       String(gear) + "," + String(lambda1, 3);
 
-    logBuffer += dataLine + "\n";
+    // 2. Compute CRC32 on the data line
+    uint32_t crc = CRC32::calculate(dataLine.c_str(), dataLine.length());
+
+    // 3. Append the CRC and add to the buffer
+    logBuffer += dataLine + "," + String(crc) + "\n";
     lineCount++;
 
+    // 4. Write buffer to SD card when full
     if (lineCount >= BUFFER_SIZE) {
       logfile.print(logBuffer);
-      logfile.flush();
-      logBuffer = "";
+      logfile.flush(); // Commit the data to the card
+      logBuffer = "";  // Clear the buffer
       lineCount = 0;
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Blink LED on successful write
+    }
+
+    // 5. Check if we need to rotate to a new log file
+    if (logfile.size() > FILE_SIZE_LIMIT && fileIndex < 999) {
+      logfile.close();
+      newLogFile();
     }
   }
 }
