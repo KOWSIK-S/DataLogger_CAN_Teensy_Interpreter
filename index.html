@@ -7,6 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@2.0.1/dist/chartjs-chart-matrix.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/papaparse/5.4.1/papaparse.min.js"></script>
     <style>
         body {
@@ -284,6 +285,7 @@
     </div>
 
     <script>
+    document.addEventListener('DOMContentLoaded', () => {
         // --- DOM Element References ---
         const uploadSection = document.getElementById('upload-section');
         const fileInput = document.getElementById('csv-files');
@@ -373,7 +375,7 @@
                     'VBAT(V)': 'VBAT',
                     'Gear': 'Gear',
                     'Lambda1': 'Lambda1',
-                    'CRC32': 'CRC32'
+                    'CRC': 'CRC'
                 };
                 
                 data = data.map(row => {
@@ -394,7 +396,10 @@
                 });
 
                 if (data.length > 0) {
-                    lastTimestamp = stitchedData[stitchedData.length - 1].Time_ms;
+                    const validTimeStamps = stitchedData.map(r => r.Time_ms).filter(t => t !== null && t !== undefined);
+                    if (validTimeStamps.length > 0) {
+                       lastTimestamp = Math.max(...validTimeStamps);
+                    }
                 }
             });
             
@@ -419,9 +424,9 @@
             
             // Calculate stats
             const validData = masterData.filter(d => d.RPM !== -1);
-            const maxRpm = Math.max(...validData.map(d => d.RPM));
-            const maxTemp = Math.max(...validData.map(d => d.Coolant));
-            const duration = time_s[time_s.length - 1] || 0;
+            const maxRpm = Math.max(0, ...validData.map(d => d.RPM));
+            const maxTemp = Math.max(0, ...validData.map(d => d.Coolant));
+            const duration = time_s.length > 0 ? time_s[time_s.length - 1] : 0;
             const minutes = Math.floor(duration / 60);
             const seconds = Math.round(duration % 60).toString().padStart(2, '0');
             const shifts = calculateShifts(validData.map(d => d.Gear));
@@ -462,23 +467,37 @@
 
         function checkIntegrity() {
             let validCount = 0;
+            let invalidCount = 0;
+
             masterData.forEach(row => {
-                const dataLine_noCRC = `${row.Time_ms},${row.RPM},${row.TPS.toFixed(2)},${row.Coolant.toFixed(1)},${row.MAP.toFixed(1)},${row.VBAT.toFixed(2)},${row.Gear},${row.Lambda1.toFixed(3)}`;
-                let crc = 0;
-                for (let i = 0; i < dataLine_noCRC.length; i++) {
-                    crc = (crc ^ dataLine_noCRC.charCodeAt(i)) & 0xFF; // Simple XOR
+                // Don't check timeout rows as their data is intentionally invalid
+                if (row.RPM === -1 || typeof row.CRC === 'undefined') {
+                    return;
                 }
-                // NOTE: This is a placeholder for a real CRC32. 
-                // A JS CRC32 library would be needed for production.
-                // For this demo, we use a simple XOR checksum.
-                // if (crc === row.CRC32) { 
-                //    validCount++;
-                // }
+                
+                // Reconstruct the line EXACTLY as the Teensy would have, before the CRC was added.
+                // This is sensitive to formatting (number of decimal places).
+                const dataLine_noCRC = `${row.Time_ms},${row.RPM},${row.TPS.toFixed(2)},${row.Coolant.toFixed(1)},${row.MAP.toFixed(1)},${row.VBAT.toFixed(2)},${row.Gear},${row.Lambda1.toFixed(3)}`;
+                
+                let calculatedCrc = 0;
+                for (let i = 0; i < dataLine_noCRC.length; i++) {
+                    calculatedCrc ^= dataLine_noCRC.charCodeAt(i);
+                }
+                
+                if (calculatedCrc === row.CRC) {
+                    validCount++;
+                } else {
+                    invalidCount++;
+                }
             });
-            // For demo purposes, we will assume a high integrity rate as we can't fully replicate the Teensy's CRC32 in JS without a library.
-            validCount = masterData.length - Math.floor(Math.random() * (masterData.length/1000)); // Simulate tiny error rate
-            const total = masterData.length;
-            return { valid: validCount, invalid: total - validCount, total: total, percentage: (validCount/total)*100 };
+
+            const total = validCount + invalidCount;
+            return { 
+                valid: validCount, 
+                invalid: invalidCount, 
+                total: total, 
+                percentage: total > 0 ? (validCount / total) * 100 : 100 
+            };
         }
         
         // --- Chart Rendering Functions ---
@@ -656,15 +675,17 @@
                 if (!aggregated[key]) {
                     aggregated[key] = { sum: 0, count: 0, x: d.x, y: d.y };
                 }
-                aggregated[key].sum += d.v;
-                aggregated[key].count++;
+                if (typeof d.v === 'number' && isFinite(d.v)) {
+                   aggregated[key].sum += d.v;
+                   aggregated[key].count++;
+                }
             });
 
             const heatmapData = Object.values(aggregated).map(d => ({
                 x: d.x,
                 y: d.y,
-                v: d.sum / d.count
-            }));
+                v: d.count > 0 ? d.sum / d.count : null
+            })).filter(d => d.v !== null);
 
             charts.fuelMap = new Chart(ctx, {
                 type: 'matrix',
@@ -675,8 +696,8 @@
                         backgroundColor(ctx) {
                             const value = ctx.dataset.data[ctx.dataIndex].v;
                             if (value === null) return 'transparent';
-                            // HSL color mapping: Red (rich) -> Yellow (stoich) -> Green (lean)
-                            const hue = 120 - (value - 0.8) * 240; // 0.8 -> 120 (green), 1.0 -> 60 (yellow), 1.3 -> 0 (red)
+                            // HSL color mapping: Red (rich, <1) -> Yellow (stoich, ~1) -> Blue (lean, >1)
+                            const hue = 240 * (1 - (Math.min(Math.max(value, 0.8), 1.2) - 0.8) / 0.4);
                             return `hsla(${hue}, 100%, 50%, 0.8)`;
                         },
                         width: (ctx) => (ctx.chart.chartArea.width / (14000/500)),
@@ -727,14 +748,15 @@
         function renderFrequencyChart() {
             const ctx = document.getElementById('frequencyChart').getContext('2d');
             const idCounts = {};
-            const duration = masterData[masterData.length - 1].Time_ms / 1000;
-            
+            const duration = masterData.length > 0 ? masterData[masterData.length - 1].Time_ms / 1000 : 0;
+            if (duration === 0) return;
+
             // This is a simulation, as we don't have raw CAN IDs in the stitched log.
             // We'll estimate based on the presence of data.
-            idCounts['0x5F0 (RPM/TPS)'] = masterData.filter(d=>d.RPM !== undefined).length;
-            idCounts['0x5F2 (Temps)'] = masterData.filter(d=>d.Coolant !== undefined).length;
-            idCounts['0x5F4 (Gear/VBat)'] = masterData.filter(d=>d.Gear !== undefined).length;
-            idCounts['0x5F6 (Lambda)'] = masterData.filter(d=>d.Lambda1 !== undefined).length;
+            idCounts['0x5F0 (RPM/TPS)'] = masterData.filter(d=>d.RPM !== undefined && d.RPM !== -1).length;
+            idCounts['0x5F2 (Temps)'] = masterData.filter(d=>d.Coolant !== undefined && d.Coolant !== -1).length;
+            idCounts['0x5F4 (Gear/VBat)'] = masterData.filter(d=>d.Gear !== undefined && d.Gear !== -1).length;
+            idCounts['0x5F6 (Lambda)'] = masterData.filter(d=>d.Lambda1 !== undefined && d.Lambda1 !== -1).length;
             
             const labels = Object.keys(idCounts);
             const data = labels.map(label => idCounts[label] / duration);
@@ -801,8 +823,13 @@
                 bodyHtml += '<tr>';
                 headers.forEach(h => {
                      let val = row[h];
-                     if (typeof val === 'number') val = val.toFixed(3);
-                     bodyHtml += `<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-400">${val}</td>`;
+                     if (typeof val === 'number') {
+                        // Avoid fixing an excessive number of decimals for integers
+                        if (val % 1 !== 0) {
+                            val = val.toFixed(3);
+                        }
+                     }
+                     bodyHtml += `<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-400">${val === null ? 'N/A' : val}</td>`;
                 });
                 bodyHtml += '</tr>';
             });
@@ -819,6 +846,8 @@
                 document.getElementById(tab.dataset.tab).classList.remove('hidden');
             });
         });
+    });
     </script>
 </body>
 </html>
+
