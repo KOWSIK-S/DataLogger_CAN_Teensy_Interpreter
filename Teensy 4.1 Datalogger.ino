@@ -23,29 +23,32 @@ void setup() {
     while (1);
   }
 
-  // Create a 10x10 matrix with example values
-  int matrix[ROWS][COLS];
-  for (int i = 0; i < ROWS; i++) {
-    for (int j = 0; j < COLS; j++) {
-      matrix[i][j] = i * COLS + j + 1; // Fill with numbers 1 to 100
-    }
+  // Write CSV headers
+  logfile.print("Timestamp(ms)");
+  for (int j = 0; j < COLS; j++) {
+    logfile.print(",Col");
+    logfile.print(j + 1);
   }
+  logfile.println();
 
-  // Write matrix to CSV
+  // Create and write a 10x10 matrix with timestamps
   for (int i = 0; i < ROWS; i++) {
+    unsigned long timestamp = millis(); // Current time in milliseconds
+    logfile.print(timestamp);
+
     for (int j = 0; j < COLS; j++) {
-      logfile.print(matrix[i][j]);
-      if (j < COLS - 1) {
-        logfile.print(","); // Comma between values
-      }
+      int value = i * COLS + j + 1; // Example data: 1 to 100
+      logfile.print(",");
+      logfile.print(value);
     }
-    logfile.println(); // Newline at the end of each row
+    logfile.println();
+    delay(100); // Optional: small delay to show changing timestamps
   }
 
   logfile.close();
-  Serial.println("Matrix written to matrix.csv");
+  Serial.println("Matrix with timestamps written to matrix.csv");
 }
 
 void loop() {
-  // Nothing to do in loop
+  // Nothing to do here
 }
